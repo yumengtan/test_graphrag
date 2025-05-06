@@ -1,6 +1,10 @@
 # GraphRAG Document Processor
 
-A modular Python system for processing various document types (URLs, YouTube videos, documents, CSV/XLSX) and creating graph representations for use with Neo4j and LLM-based graph analysis. Uses `RecursiveCharacterTextSplitter` with chunk size 200 and no overlap for consistent chunking across all document types.
+Processing various document types (URLs, YouTube videos, documents, CSV/XLSX) and creating graph representations for use with Neo4j and LLM-based graph analysis. Uses `RecursiveCharacterTextSplitter` with chunk size 200 and no overlap for consistent chunking across all document types.
+
+`RecursiveCharacterTextSpliiter` was used based on findings from https://github.com/ALucek/chunking-strategies/blob/main/chunking.ipynb. 
+The RecursiveCharacterTextSplitter with chunk size 200 and no overlap performs consistently well across all metrics (88.1% recall, 7.0% precision, 29.9% PrecisionΩ)
+This is significant because it's a simpler, more commonly available method
 
 ## Overview
 
