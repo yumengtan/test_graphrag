@@ -9,35 +9,162 @@ class GraphProcessor:
     def __init__(self, relationship_extractor: RelationshipExtractor):
         self.relationship_extractor = relationship_extractor
         
-    def create_cypher_statements(self, chunks: List[Chunk]) -> List[str]:
-        """Generate Cypher statements for creating nodes and relationships"""
-        
+    def create_cypher_statements_with_communities(
+        self, 
+        chunks: List[Chunk], 
+        chunk_relationships: List[Dict[str, Any]],
+        batch_results: Dict[str, Any]
+    ) -> List[str]:
+        """Generate Cypher statements with community detection"""
         cypher_statements = []
         
-        # Process each chunk to extract entities and relationships
+        # Collect all entities and relationships
         all_entities = []
         all_relationships = []
         
-        for chunk in chunks:
-            entities, relationships = self.relationship_extractor.extract_entities_and_relationships(chunk)
-            chunk.entities = entities
-            chunk.relationships = relationships
+        for batch_key, batch_data in batch_results.items():
+            if "entities" in batch_data:
+                all_entities.extend(batch_data["entities"])
             
-            all_entities.extend(entities)
-            all_relationships.extend(relationships)
+            if "relationships" in batch_data:
+                all_relationships.extend(batch_data["relationships"])
+            
+            if "cross_relationships" in batch_data:
+                all_relationships.extend(batch_data["cross_relationships"])
         
-        # Extract cross-chunk relationships
-        cross_relationships = self.relationship_extractor.extract_relationships_between_chunks(chunks)
-        all_relationships.extend(cross_relationships)
+        # 1. Create Document node
+        for source in set(chunk.source for chunk in chunks):
+            source_type = chunks[0].source_type  # Assuming all chunks have same source type
+            doc_cypher = f"""
+            CREATE (:Document {{
+                id: '{self._escape_cypher_string(source)}',
+                type: '{source_type}',
+                name: '{self._escape_cypher_string(source.split('/')[-1])}',
+                created_at: timestamp()
+            }})
+            """
+            cypher_statements.append(doc_cypher)
         
-        # Create Cypher statements
-        cypher_statements.extend(self._create_document_nodes(chunks))
-        cypher_statements.extend(self._create_chunk_nodes(chunks))
-        cypher_statements.extend(self._create_entity_nodes(all_entities))
-        cypher_statements.extend(self._create_chunk_relationships(chunks))
-        cypher_statements.extend(self._create_entity_relationships(all_relationships))
+        # 2. Create Chunk nodes
+        for chunk in chunks:
+            chunk_cypher = f"""
+            CREATE (:Chunk {{
+                id: '{chunk.chunk_id}',
+                content: '{self._escape_cypher_string(chunk.content)}',
+                source: '{self._escape_cypher_string(chunk.source)}',
+                source_type: '{chunk.source_type}',
+                chunk_index: {chunk.metadata.get('chunk_index', 0)},
+                created_at: timestamp()
+            }})
+            """
+            cypher_statements.append(chunk_cypher)
+        
+        # 3. Create Document-Chunk relationships
+        for chunk in chunks:
+            rel_cypher = f"""
+            MATCH (d:Document {{id: '{self._escape_cypher_string(chunk.source)}'}})
+            MATCH (c:Chunk {{id: '{chunk.chunk_id}'}})
+            CREATE (c)-[:PART_OF]->(d)
+            """
+            cypher_statements.append(rel_cypher)
+        
+        # 4. Create Chunk-Chunk relationships
+        for rel in chunk_relationships:
+            rel_props = ", ".join([f"{k}: {v}" for k, v in rel["properties"].items()])
+            rel_cypher = f"""
+            MATCH (c1:Chunk {{id: '{rel["source_id"]}'}})
+            MATCH (c2:Chunk {{id: '{rel["target_id"]}'}})
+            CREATE (c1)-[:{rel["type"]} {{{rel_props}}}]->(c2)
+            """
+            cypher_statements.append(rel_cypher)
+        
+        # 5. Create Entity nodes
+        for entity in all_entities:
+            entity_cypher = f"""
+            CREATE (:{entity.type} {{
+                id: '{entity.id}',
+                name: '{self._escape_cypher_string(entity.name)}',
+                type: '{entity.type}',
+                description: '{self._escape_cypher_string(entity.description or '')}',
+                created_at: timestamp()
+            }})
+            """
+            cypher_statements.append(entity_cypher)
+        
+        # 6. Create Chunk-Entity relationships
+        for chunk in chunks:
+            if not chunk.entities:
+                continue
+                
+            for entity in chunk.entities:
+                rel_cypher = f"""
+                MATCH (c:Chunk {{id: '{chunk.chunk_id}'}})
+                MATCH (e:{entity.type} {{id: '{entity.id}'}})
+                CREATE (c)-[:HAS_ENTITY]->(e)
+                """
+                cypher_statements.append(rel_cypher)
+        
+        # 7. Create Entity-Entity relationships
+        for rel in all_relationships:
+            rel_cypher = f"""
+            MATCH (s {{id: '{rel.source_entity_id}'}})
+            MATCH (t {{id: '{rel.target_entity_id}'}})
+            CREATE (s)-[:{rel.type} {{
+                id: '{rel.id}',
+                description: '{self._escape_cypher_string(rel.description or '')}'
+            }}]->(t)
+            """
+            cypher_statements.append(rel_cypher)
+        
+        # 8. Create community detection Cypher statements
+        community_cypher = """
+        // Create entity projection for community detection
+        CALL gds.graph.project('entity_graph',
+            '*',
+            {
+                RELATED_TO: {
+                    type: '*',
+                    orientation: 'UNDIRECTED'
+                }
+            }
+        )
+        
+        // Run Louvain community detection
+        CALL gds.louvain.write('entity_graph', {
+            writeProperty: 'community',
+            relationshipWeightProperty: null
+        })
+        
+        // Create community nodes
+        MATCH (e)
+        WHERE e.community IS NOT NULL
+        WITH distinct e.community AS communityId, collect(e) AS communityMembers
+        CREATE (c:__Community__ {
+            id: 'community_' + communityId,
+            name: 'Community ' + communityId,
+            size: size(communityMembers),
+            level: 0,
+            created_at: timestamp()
+        })
+        
+        // Create entity to community relationships
+        WITH *
+        UNWIND communityMembers AS entity
+        MATCH (c:__Community__ {id: 'community_' + entity.community})
+        CREATE (entity)-[:IN_COMMUNITY]->(c)
+        
+        // Clean up
+        CALL gds.graph.drop('entity_graph')
+        """
+        cypher_statements.append(community_cypher)
         
         return cypher_statements
+    
+    def _escape_cypher_string(self, text: str) -> str:
+        """Escape special characters for Cypher queries"""
+        if not text:
+            return ""
+        return text.replace("'", "\\'").replace('"', '\\"').replace('\n', '\\n')
     
     def _create_document_nodes(self, chunks: List[Chunk]) -> List[str]:
         """Create document nodes"""

@@ -1,5 +1,6 @@
 import os
 import logging
+import queue
 from typing import Dict, Any, List, Tuple, Optional, Union
 from urllib.parse import urlparse
 import re
@@ -30,32 +31,25 @@ except ImportError:
 
 
 class DocumentProcessor:
-    """Main document processor that orchestrates the extraction, chunking, and graph generation process"""
+    """Enhanced document processor with batched processing and progress tracking"""
     
     def __init__(
         self, 
         llm: Optional[LocalLLM] = None,
         chunk_size: int = 200, 
         chunk_overlap: int = 0,
+        batch_size: int = 10,
         neo4j_uri: str = "bolt://localhost:7687",
         neo4j_username: str = "neo4j",
         neo4j_password: str = "password",
-        neo4j_database: str = "neo4j"
+        neo4j_database: str = "neo4j",
+        num_workers: int = 4
     ):
-        """Initialize document processor
-        
-        Args:
-            llm: Local LLM for entity and relationship extraction
-            chunk_size: Size of chunks for text splitting
-            chunk_overlap: Overlap between chunks
-            neo4j_uri: Neo4j database URI
-            neo4j_username: Neo4j username
-            neo4j_password: Neo4j password 
-            neo4j_database: Neo4j database name
-        """
         self.llm = llm or LocalLLM()
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.batch_size = batch_size
+        self.num_workers = num_workers
         
         # Neo4j connection details
         self.neo4j_uri = neo4j_uri
@@ -64,7 +58,7 @@ class DocumentProcessor:
         self.neo4j_database = neo4j_database
         self.neo4j_graph = None
         
-        # Try to connect to Neo4j
+        # Initialize components
         if NEO4J_AVAILABLE:
             try:
                 self.neo4j_graph = Neo4jGraph(
@@ -73,69 +67,121 @@ class DocumentProcessor:
                     password=self.neo4j_password,
                     database=self.neo4j_database
                 )
-                logging.info(f"Connected to Neo4j at {self.neo4j_uri}")
             except Exception as e:
                 logging.error(f"Error connecting to Neo4j: {e}")
         
         self.text_chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        self.relationship_extractor = RelationshipExtractor(self.llm)
+        self.relationship_extractor = RelationshipExtractor(self.llm, num_workers=num_workers)
         self.graph_processor = GraphProcessor(self.relationship_extractor)
         
-        # Initialize specialized extractors with LLM for hybrid approach
-        self.csv_extractor = CSVExtractor(llm=self.llm)
-        self.excel_extractor = ExcelExtractor(llm=self.llm)
+        # For batch processing
+        self.processing_queue = queue()
+        self.results = {}
+        self.failed_chunks = []
         
-        # Initialize Neo4j wrapper
-        self.neo4j_wrapper = Neo4jExtractorWrapper(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        
-        # Setup text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
-            is_separator_regex=False,
-        )
-        
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
     
     def process_document(self, source: str) -> Dict[str, Any]:
-        """Process a document and generate graph data
-        
-        Args:
-            source: Path or URL to document
-            
-        Returns:
-            Dictionary with document metadata, chunks, and graph data
-        """
+        """Process document with batched processing and progress tracking"""
         self.logger.info(f"Processing document: {source}")
         
         # Determine source type
         source_type = self._detect_source_type(source)
-        self.logger.info(f"Detected source type: {source_type}")
         
-        # Extract documents based on source type
+        # Extract documents
         documents = self._extract_documents(source, source_type)
-        self.logger.info(f"Extracted {len(documents)} documents/pages")
         
-        # Override Neo4j's chunking with our own
-        # First, we'll ensure all documents have text content
+        # Preprocess documents
         processed_documents = self._preprocess_documents(documents)
         
-        # Chunk documents using our RecursiveCharacterTextSplitter
-        chunks = self._chunk_documents(processed_documents, source, source_type)
-        self.logger.info(f"Created {len(chunks)} chunks")
+        # Chunk documents with relationships
+        chunks, chunk_relationships = self._chunk_documents_with_relationships(processed_documents, source, source_type)
         
-        # Generate graph data
-        cypher_statements = self.graph_processor.create_cypher_statements(chunks)
-        self.logger.info(f"Generated {len(cypher_statements)} Cypher statements")
+        # Process chunks in batches
+        total_chunks = len(chunks)
+        processed_chunks = 0
+        success_count = 0
+        failure_count = 0
+        
+        # Add chunks to processing queue in batches
+        for i in range(0, total_chunks, self.batch_size):
+            batch = chunks[i:i+self.batch_size]
+            self.processing_queue.put((batch, i))
+        
+        # Process queue
+        while not self.processing_queue.empty():
+            batch, batch_index = self.processing_queue.get()
+            
+            try:
+                # Process batch
+                batch_results = self._process_batch(batch, chunk_relationships)
+                
+                # Update counts
+                processed_chunks += len(batch)
+                success_count += len(batch)
+                
+                # Store results
+                self.results[f"batch_{batch_index}"] = batch_results
+                
+                progress = (processed_chunks / total_chunks) * 100
+                self.logger.info(f"Progress: {progress:.2f}% ({processed_chunks}/{total_chunks} chunks)")
+                
+            except Exception as e:
+                failure_count += len(batch)
+                self.logger.error(f"Error processing batch {batch_index}: {e}")
+                self.failed_chunks.extend(batch)
+        
+        # Generate graph
+        cypher_statements = self.graph_processor.create_cypher_statements_with_communities(
+            chunks, chunk_relationships, self.results
+        )
         
         return {
             "source": source,
             "source_type": source_type,
+            "total_chunks": total_chunks,
+            "processed_chunks": processed_chunks,
+            "success_count": success_count,
+            "failure_count": failure_count,
             "chunks": [chunk.__dict__ for chunk in chunks],
             "cypher_statements": cypher_statements
         }
+    
+    def _process_batch(self, batch: List[Chunk], chunk_relationships: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Process a batch of chunks in parallel"""
+        # Extract entities and relationships using parallel extractor
+        extraction_results = self.relationship_extractor.extract_entities_and_relationships_batch(batch)
+        
+        # Extract cross-chunk relationships
+        cross_relationships = self.relationship_extractor.extract_cross_chunk_relationships(batch)
+        
+        return {
+            "chunks": batch,
+            "entities": extraction_results["entities"],
+            "relationships": extraction_results["relationships"],
+            "cross_relationships": cross_relationships
+        }
+    
+    def _chunk_documents_with_relationships(self, documents: List[Document], source: str, source_type: str) -> Tuple[List[Chunk], List[Dict[str, Any]]]:
+        """Chunk documents and create relationships between chunks"""
+        all_chunks = []
+        all_relationships = []
+        
+        for i, doc in enumerate(documents):
+            # Get document content
+            text = doc.page_content
+            
+            # Get metadata
+            metadata = doc.metadata.copy() if hasattr(doc, 'metadata') else {}
+            metadata.update({"doc_index": i})
+            
+            # Create chunks with relationships
+            chunks, relationships = self.text_chunker.chunk_text(text, source, source_type, metadata)
+            all_chunks.extend(chunks)
+            all_relationships.extend(relationships)
+            
+        return all_chunks, all_relationships
     
     def extract_schema(self) -> str:
         """Extract schema from the Neo4j database
